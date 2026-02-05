@@ -959,8 +959,15 @@ class DriverInfoComponent(BaseComponent):
 
 
 class ControlsPopupComponent(BaseComponent):
-    def __init__(self, width: int = 420, height: int = 260, header_font_size: int = 18, body_font_size: int = 16):
-        
+    def __init__(
+        self,
+        width: int = 420,
+        height: int = 260,
+        header_font_size: int = 18,
+        body_font_size: int = 16,
+        lines: Optional[list[str]] = None,
+    ):
+
         self.width = width
         self.height = height
         self.visible = False
@@ -970,9 +977,27 @@ class ControlsPopupComponent(BaseComponent):
         
         self.header_font_size = header_font_size
         self.body_font_size = body_font_size
+        self.lines = lines
         
         self._header_text = arcade.Text("", 0, 0, arcade.color.BLACK, self.header_font_size, anchor_x="left", anchor_y="center")
         self._body_text = arcade.Text("", 0, 0, arcade.color.LIGHT_GRAY, self.body_font_size, anchor_x="left", anchor_y="center")
+
+    def _default_lines(self) -> list[str]:
+        return [
+            " ",
+            "[SPACE] Pause/Resume",
+            "← / →  Jump back/forward",
+            "↑ / ↓  Speed +/-",
+            "[1-4]  Set speed: 0.5x / 1x / 2x / 4x",
+            "[R]    Restart",
+            "[D]    Toggle DRS Zones",
+            "[B]    Toggle Progress Bar",
+            "[L]    Toggle Driver Labels",
+            "[H]    Toggle Help Popup",
+        ]
+
+    def set_lines(self, lines: Optional[list[str]]):
+        self.lines = lines
 
     def set_size(self, width: int, height: int):
         
@@ -1028,18 +1053,7 @@ class ControlsPopupComponent(BaseComponent):
         self._header_text.draw()
 
 
-        lines = [
-            " ",
-            "[SPACE] Pause/Resume",
-            "← / →  Jump back/forward",
-            "↑ / ↓  Speed +/-",
-            "[1-4]  Set speed: 0.5x / 1x / 2x / 4x",
-            "[R]    Restart",
-            "[D]    Toggle DRS Zones",
-            "[B]    Toggle Progress Bar",
-            "[L]    Toggle Driver Labels",
-            "[H]    Toggle Help Popup",
-        ]
+        lines = self.lines if self.lines is not None else self._default_lines()
         
         line_spacing = max(18, int(self.body_font_size + 8))
         y = header_cy - 20
