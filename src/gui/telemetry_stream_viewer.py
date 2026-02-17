@@ -258,7 +258,7 @@ class TelemetryStreamViewer(QMainWindow):
         """Handle window close event."""
         if self.client.isRunning():
             self.client.stop()
-            self.client.wait()
+            self.client.wait(2000)  # Wait max 2 seconds
         event.accept()
 
 
