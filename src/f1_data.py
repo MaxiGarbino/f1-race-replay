@@ -171,6 +171,217 @@ def get_circuit_rotation(session):
     return circuit.rotation
 
 
+def _compute_safety_car_positions(frames, track_statuses, session):
+    """
+    Simulate safety car (SC) positions for each frame based on track status.
+    
+    The F1 API does not provide SC GPS data, so we simulate it:
+    - SC appears when track status is "4" (Safety Car deployed)
+    - SC position is placed ahead of the race leader on the track reference polyline
+    - Transition animations simulate pit lane entry (deploying) and exit (returning)
+    
+    Each frame gets a 'safety_car' key with:
+      - x, y: world coordinates of the SC
+      - phase: 'deploying' | 'on_track' | 'returning' | None
+      - alpha: 0.0-1.0 for fade in/out animation
+    """
+    if not frames or not track_statuses:
+        return
+
+    # Build reference polyline from the first driver's telemetry to get track shape
+    # We'll use the track's X/Y from example lap data embedded in the session
+    try:
+        fastest_lap = session.laps.pick_fastest()
+        if fastest_lap is None:
+            print("Safety Car: No fastest lap found, skipping SC position computation")
+            return
+        tel = fastest_lap.get_telemetry()
+        if tel is None or tel.empty:
+            print("Safety Car: No telemetry data, skipping SC position computation")
+            return
+        
+        ref_xs = tel["X"].to_numpy().astype(float)
+        ref_ys = tel["Y"].to_numpy().astype(float)
+        ref_dist = tel["Distance"].to_numpy().astype(float)
+        
+        if len(ref_xs) < 10:
+            print("Safety Car: Insufficient reference points, skipping")
+            return
+        
+        # Interpolate reference to high density for smooth positioning
+        from scipy.spatial import cKDTree
+        t_old = np.linspace(0, 1, len(ref_xs))
+        t_new = np.linspace(0, 1, 4000)
+        ref_xs_dense = np.interp(t_new, t_old, ref_xs)
+        ref_ys_dense = np.interp(t_new, t_old, ref_ys)
+        ref_dist_dense = np.interp(t_new, t_old, ref_dist)
+        
+        # Build KD-Tree for fast leader position lookups
+        ref_tree = cKDTree(np.column_stack((ref_xs_dense, ref_ys_dense)))
+        
+        # Cumulative distance along reference
+        diffs = np.sqrt(np.diff(ref_xs_dense)**2 + np.diff(ref_ys_dense)**2)
+        ref_cumdist = np.concatenate(([0.0], np.cumsum(diffs)))
+        ref_total = float(ref_cumdist[-1])
+        
+        # Compute normals (for slight offset to simulate SC driving position)
+        dx = np.gradient(ref_xs_dense)
+        dy = np.gradient(ref_ys_dense)
+        norm = np.sqrt(dx**2 + dy**2)
+        norm[norm == 0] = 1.0
+        ref_nx = -dy / norm
+        ref_ny = dx / norm
+        
+    except Exception as e:
+        print(f"Safety Car: Failed to build reference polyline: {e}")
+        return
+
+    # Identify SC deployment periods from track_statuses
+    sc_periods = []
+    for status in track_statuses:
+        if str(status.get("status", "")) == "4":
+            sc_periods.append({
+                "start_time": status["start_time"],
+                "end_time": status.get("end_time"),
+            })
+    
+    if not sc_periods:
+        print("Safety Car: No SC periods found in this session")
+        return
+
+    print(f"Safety Car: Found {len(sc_periods)} SC deployment period(s)")
+    
+    # Animation durations (in seconds)
+    DEPLOY_DURATION = 3.0    # Time for SC to emerge from pit lane
+    RETURN_DURATION = 3.0    # Time for SC to return to pit lane
+    SC_OFFSET_METERS = 500   # How far ahead of the leader the SC drives
+
+    def get_leader_position(frame):
+        """Get the leader's (x, y) from a frame."""
+        drivers = frame.get("drivers", {})
+        if not drivers:
+            return None, None
+        # Find driver with highest progress (first one since they're sorted)
+        best_code = None
+        best_progress = -1
+        for code, pos in drivers.items():
+            lap = pos.get("lap", 1)
+            dist = pos.get("dist", 0)
+            progress = (max(lap, 1) - 1) * ref_total + dist
+            if progress > best_progress:
+                best_progress = progress
+                best_code = code
+        if best_code:
+            return drivers[best_code]["x"], drivers[best_code]["y"]
+        return None, None
+
+    def get_sc_position_on_track(leader_x, leader_y, offset_meters=SC_OFFSET_METERS):
+        """Place the SC `offset_meters` ahead of the leader on the reference line."""
+        _, leader_idx = ref_tree.query([leader_x, leader_y])
+        leader_idx = int(leader_idx)
+        leader_dist = ref_cumdist[leader_idx]
+        
+        # SC is ahead of leader by offset_meters (wrapping around)
+        sc_dist = (leader_dist + offset_meters) % ref_total
+        
+        # Find the corresponding reference point
+        sc_idx = int(np.searchsorted(ref_cumdist, sc_dist))
+        sc_idx = min(sc_idx, len(ref_xs_dense) - 1)
+        
+        return float(ref_xs_dense[sc_idx]), float(ref_ys_dense[sc_idx])
+
+    def get_pitlane_position():
+        """
+        Get an approximate pit lane position (offset from the start/finish line).
+        We offset the first reference point inward to simulate the pit lane.
+        """
+        pit_offset = 600  # metres offset inward from track center
+        idx = 0
+        px = float(ref_xs_dense[idx] + ref_nx[idx] * pit_offset)
+        py = float(ref_ys_dense[idx] + ref_ny[idx] * pit_offset)
+        return px, py
+
+    pit_x, pit_y = get_pitlane_position()
+
+    for frame in frames:
+        t = frame["t"]
+        
+        # Check if current time falls in any SC period
+        active_sc = None
+        for sc in sc_periods:
+            sc_start = sc["start_time"]
+            sc_end = sc.get("end_time")
+            # Include some buffer for the return animation
+            effective_end = (sc_end + RETURN_DURATION) if sc_end else None
+            
+            if t >= sc_start and (effective_end is None or t < effective_end):
+                active_sc = sc
+                break
+        
+        if active_sc is None:
+            # No SC active
+            frame["safety_car"] = None
+            continue
+        
+        sc_start = active_sc["start_time"]
+        sc_end = active_sc.get("end_time")
+        
+        # Determine phase
+        elapsed = t - sc_start
+        
+        if elapsed < DEPLOY_DURATION:
+            # DEPLOYING: SC emerging from pit lane onto the track
+            phase = "deploying"
+            alpha = elapsed / DEPLOY_DURATION  # 0 -> 1
+            
+            # Interpolate between pit lane and on-track position
+            leader_x, leader_y = get_leader_position(frame)
+            if leader_x is not None:
+                track_x, track_y = get_sc_position_on_track(leader_x, leader_y)
+                sc_x = pit_x + alpha * (track_x - pit_x)
+                sc_y = pit_y + alpha * (track_y - pit_y)
+            else:
+                sc_x, sc_y = pit_x, pit_y
+                
+        elif sc_end is not None and t >= sc_end:
+            # RETURNING: SC going back to pit lane
+            phase = "returning"
+            return_elapsed = t - sc_end
+            alpha = max(0.0, 1.0 - (return_elapsed / RETURN_DURATION))  # 1 -> 0
+            
+            # Interpolate between on-track position and pit lane
+            leader_x, leader_y = get_leader_position(frame)
+            if leader_x is not None:
+                track_x, track_y = get_sc_position_on_track(leader_x, leader_y)
+                sc_x = track_x + (1.0 - alpha) * (pit_x - track_x)
+                sc_y = track_y + (1.0 - alpha) * (pit_y - track_y)
+            else:
+                sc_x, sc_y = pit_x, pit_y
+        else:
+            # ON TRACK: SC fully deployed, driving ahead of leader
+            phase = "on_track"
+            alpha = 1.0
+            
+            leader_x, leader_y = get_leader_position(frame)
+            if leader_x is not None:
+                sc_x, sc_y = get_sc_position_on_track(leader_x, leader_y)
+            else:
+                # Fallback: use first reference point
+                sc_x = float(ref_xs_dense[0])
+                sc_y = float(ref_ys_dense[0])
+        
+        frame["safety_car"] = {
+            "x": round(sc_x, 2),
+            "y": round(sc_y, 2),
+            "phase": phase,
+            "alpha": round(alpha, 3),
+        }
+
+    # Count frames with SC data
+    sc_frame_count = sum(1 for f in frames if f.get("safety_car") is not None)
+    print(f"Safety Car: Computed positions for {sc_frame_count} frames")
+
+
 def get_race_telemetry(session, session_type="R"):
     event_name = str(session).replace(" ", "_")
     cache_suffix = "sprint" if session_type == "S" else "race"
@@ -460,6 +671,9 @@ def get_race_telemetry(session, session_type="R"):
             frame_payload["weather"] = weather_snapshot
 
         frames.append(frame_payload)
+
+    # 5d. Compute Safety Car positions for each frame
+    _compute_safety_car_positions(frames, formatted_track_statuses, session)
     print("completed telemetry extraction...")
     print("Saving to cache file...")
     # If computed_data/ directory doesn't exist, create it
